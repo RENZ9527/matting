@@ -10,14 +10,12 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
-import torch.nn.functional as F
-from PIL import Image
 from tqdm import tqdm
 
 from models.unified_dataset import UnifiedDataset
 from models.utils import parse_flux_model_configs
 from pipelines.flux_image_new import FluxImagePipeline
-from utils.metric import compute_matting_metrics
+from utils.eval_matting import test as builtin_eval_matting
 
 
 # ============================================================
@@ -38,7 +36,7 @@ DEFAULT_BENCHMARKS: Dict[str, BenchmarkConfig] = {
         name="p3m-np",
         gt_root="/nvmedata/workspace2/users/rzc/datasets/P3M-10k",
         file_list="./data_split/P3M_matting/filenames_val_NP.txt",
-        output_subdir="p3m_np",
+        output_subdir="p3m_np_full",
     ),
 
     # AM-2K
@@ -46,7 +44,7 @@ DEFAULT_BENCHMARKS: Dict[str, BenchmarkConfig] = {
         name="am",
         gt_root="/nvmedata/workspace2/users/rzc/datasets/AM-2k",
         file_list="./data_split/AM_matting/filenames_val.txt",
-        output_subdir="am_2k",
+        output_subdir="am_2k_full",
     ),
 
     # AIM-500
@@ -54,7 +52,7 @@ DEFAULT_BENCHMARKS: Dict[str, BenchmarkConfig] = {
         name="aim",
         gt_root="/nvmedata/workspace2/users/rzc/datasets/AIM-500",
         file_list="./data_split/AIM_matting/filenames_val.txt",
-        output_subdir="aim_500",
+        output_subdir="aim_500_full",
     ),
 }
 
@@ -849,7 +847,9 @@ def run_benchmark_inference(
                 transform(str(trimap_path)),
             ]
 
-            with torch.inference_mode():
+            # Keep the inference path aligned with test.py: save the raw pipeline
+            # output directly and leave shape/range handling to evaluation.
+            with torch.no_grad():
                 output = pipe(
                     prompt=prompt,
                     kontext_images=kontext_images,
@@ -860,11 +860,9 @@ def run_benchmark_inference(
                     seed=seed,
                     output_type="np",
                     rand_device=pipe.device,
-                    deterministic_flow=deterministic_flow,
+                    deterministic_flow=False,
                     task="matting",
                 )
-
-            prediction = normalize_prediction_array(output)
 
             temporary_path = save_path.with_suffix(
                 save_path.suffix + ".tmp"
@@ -872,7 +870,7 @@ def run_benchmark_inference(
 
             # 使用文件句柄避免 np.save 自动添加 .npy 后缀。
             with temporary_path.open("wb") as f:
-                np.save(f, prediction)
+                np.save(f, output)
 
             os.replace(temporary_path, save_path)
             succeeded += 1
@@ -921,179 +919,21 @@ def run_benchmark_inference(
 # Matting 指标评估
 # ============================================================
 
-def load_image_rgb_or_grayscale(
-    image_path: str,
-) -> Optional[np.ndarray]:
-    try:
-        if image_path.lower().endswith(".npy"):
-            image_array = np.load(image_path)
-        else:
-            with Image.open(image_path) as image:
-                image_array = np.asarray(image)
-
-        image_array = np.asarray(image_array)
-
-        while image_array.ndim > 3 and image_array.shape[0] == 1:
-            image_array = image_array[0]
-
-        if image_array.ndim == 3:
-            if image_array.shape[-1] in (1, 3, 4):
-                if image_array.shape[-1] == 1:
-                    image_array = image_array[..., 0]
-                else:
-                    image_array = image_array[..., :3].mean(axis=-1)
-
-            elif image_array.shape[0] in (1, 3, 4):
-                if image_array.shape[0] == 1:
-                    image_array = image_array[0]
-                else:
-                    image_array = image_array[:3].mean(axis=0)
-
-        if image_array.ndim != 2:
-            raise ValueError(
-                f"无法转换为二维图像：shape={image_array.shape}"
-            )
-
-        return image_array.astype(np.float32)
-
-    except Exception as exc:
-        print(
-            f"[eval] 加载失败：{image_path}, error={exc}"
-        )
-        return None
-
-
-def resize_array(
-    array: np.ndarray,
-    target_height: int,
-    target_width: int,
-) -> np.ndarray:
-    tensor = torch.from_numpy(array).float()
-    tensor = tensor.unsqueeze(0).unsqueeze(0)
-
-    resized = F.interpolate(
-        tensor,
-        size=(target_height, target_width),
-        mode="bilinear",
-        align_corners=True,
-    )
-
-    return resized[0, 0].numpy()
-
-
-def normalize_gt_alpha(
-    alpha: np.ndarray,
-) -> np.ndarray:
-    alpha = alpha.astype(np.float32)
-
-    alpha[np.isnan(alpha)] = 0
-    alpha[np.isposinf(alpha)] = 255
-    alpha[np.isneginf(alpha)] = 0
-
-    if alpha.size > 0 and alpha.max() > 1.5:
-        alpha = alpha / 255.0
-
-    return np.clip(alpha, 0.0, 1.0)
-
-
-def normalize_pred_alpha(
-    prediction: np.ndarray,
-) -> np.ndarray:
-    prediction = prediction.astype(np.float32)
-
-    prediction[np.isnan(prediction)] = 0
-    prediction[np.isposinf(prediction)] = 1
-    prediction[np.isneginf(prediction)] = 0
-
-    if prediction.size > 0 and prediction.max() > 1.5:
-        prediction = prediction / 255.0
-
-    return np.clip(prediction, 0.0, 1.0)
-
-
-def evaluate_one_sample(
-    task: Tuple[str, str, str],
-) -> Tuple[float, float, float, float, float, str]:
-    pred_path, alpha_path, trimap_path = task
-
-    try:
-        prediction = load_image_rgb_or_grayscale(pred_path)
-        alpha = load_image_rgb_or_grayscale(alpha_path)
-        trimap = load_image_rgb_or_grayscale(trimap_path)
-
-        if prediction is None:
-            raise RuntimeError("prediction load failed")
-
-        if alpha is None:
-            raise RuntimeError("alpha load failed")
-
-        if trimap is None:
-            raise RuntimeError("trimap load failed")
-
-        alpha = normalize_gt_alpha(alpha)
-        prediction = normalize_pred_alpha(prediction)
-
-        target_height, target_width = alpha.shape
-
-        if prediction.shape != alpha.shape:
-            prediction = resize_array(
-                prediction,
-                target_height,
-                target_width,
-            )
-            prediction = np.clip(
-                prediction,
-                0.0,
-                1.0,
-            )
-
-        if trimap.shape != alpha.shape:
-            trimap = resize_array(
-                trimap,
-                target_height,
-                target_width,
-            )
-
-        mse, mad, sad, grad, conn = compute_matting_metrics(
-            prediction,
-            alpha,
-            trimap,
-            whole=True,
-        )
-
-        metrics = np.asarray(
-            [mse, mad, sad, grad, conn],
-            dtype=np.float64,
-        )
-
-        if not np.all(np.isfinite(metrics)):
-            raise RuntimeError(
-                f"指标出现 NaN/Inf：{metrics.tolist()}"
-            )
-
-        if np.any(metrics < 0):
-            raise RuntimeError(
-                f"指标出现负数：{metrics.tolist()}"
-            )
-
-        return (
-            float(mse),
-            float(mad),
-            float(sad),
-            float(grad),
-            float(conn),
-            "",
-        )
-
-    except Exception as exc:
-        return (
-            np.nan,
-            np.nan,
-            np.nan,
-            np.nan,
-            np.nan,
-            f"{pred_path}: {exc}",
-        )
+def parse_builtin_eval_result(result_text: str) -> Dict[str, float]:
+    """
+    Parse the comma-separated output returned by utils.eval_matting.test().
+    Expected order: MSE, MAD, SAD, Grad, Conn.
+    """
+    values = [float(x.strip()) for x in result_text.strip().split(",")]
+    if len(values) != 5:
+        raise ValueError(f"无法解析内置评估结果：{result_text!r}")
+    return {
+        "MSE": values[0],
+        "MAD": values[1],
+        "SAD": values[2],
+        "Grad": values[3],
+        "Conn": values[4],
+    }
 
 
 def run_benchmark_evaluation(
@@ -1102,140 +942,42 @@ def run_benchmark_evaluation(
     max_samples: Optional[int],
     workers: int,
 ) -> Dict:
+    """
+    Use the repository's built-in matting evaluation path instead of keeping a
+    separate metric implementation in this script.
+    """
     gt_root = Path(benchmark.gt_root)
-    file_list = Path(benchmark.file_list)
-
-    samples = read_file_list(
-        file_list,
-        max_samples=max_samples,
-    )
-
-    tasks = []
-
-    for merged_rel, trimap_rel, alpha_rel in samples:
-        pred_path = (
-            benchmark_output
-            / prediction_relative_path(merged_rel)
-        )
-        trimap_path = gt_root / trimap_rel
-        alpha_path = gt_root / alpha_rel
-
-        tasks.append(
-            (
-                str(pred_path),
-                str(alpha_path),
-                str(trimap_path),
-            )
-        )
 
     print()
     print("=" * 80)
     print(f"[eval] benchmark={benchmark.name}")
     print(f"[eval] prediction_root={benchmark_output}")
-    print(f"[eval] samples={len(tasks)}")
-    print(f"[eval] workers={workers}")
+    print(f"[eval] gt_root={gt_root}")
+    print("[eval] backend=utils.eval_matting.test")
     print("=" * 80)
 
-    results = []
-
-    if workers <= 1:
-        iterator = map(evaluate_one_sample, tasks)
-
-        for result in tqdm(
-            iterator,
-            total=len(tasks),
-            desc=f"Evaluation: {benchmark.name}",
-        ):
-            results.append(result)
-
-    else:
-        context = mp.get_context("spawn")
-
-        with context.Pool(processes=workers) as pool:
-            iterator = pool.imap_unordered(
-                evaluate_one_sample,
-                tasks,
-                chunksize=1,
-            )
-
-            for result in tqdm(
-                iterator,
-                total=len(tasks),
-                desc=f"Evaluation: {benchmark.name}",
-            ):
-                results.append(result)
-
-    if not results:
-        raise RuntimeError(
-            f"benchmark {benchmark.name} 没有评估结果。"
-        )
-
-    metrics_array = np.asarray(
-        [result[:5] for result in results],
-        dtype=np.float64,
+    eval_args = argparse.Namespace(
+        pred_path=str(benchmark_output),
+        gt_path=str(gt_root),
+        dataset=benchmark.name,
+        max_samples=max_samples,
     )
+    result_text = builtin_eval_matting(eval_args)
+    parsed = parse_builtin_eval_result(result_text)
 
-    valid_mask = np.all(
-        np.isfinite(metrics_array),
-        axis=1,
-    )
-    valid_metrics = metrics_array[valid_mask]
-
-    errors = [
-        result[5]
-        for result in results
-        if result[5]
-    ]
-
-    if len(valid_metrics) == 0:
-        raise RuntimeError(
-            f"{benchmark.name} 没有任何有效评估结果。"
-        )
-
-    mean_metrics = valid_metrics.mean(axis=0)
-
+    # utils.eval_matting.test() already prints the exact valid count. Keep the
+    # summary fields consistent for downstream JSON/TXT logging.
+    total = len(read_file_list(Path(benchmark.file_list), max_samples=max_samples))
     result = {
         "benchmark": benchmark.name,
-        "total": len(tasks),
-        "valid": int(valid_mask.sum()),
-        "failed": int((~valid_mask).sum()),
-        "MSE": float(mean_metrics[0]),
-        "MAD": float(mean_metrics[1]),
-        "SAD": float(mean_metrics[2]),
-        "Grad": float(mean_metrics[3]),
-        "Conn": float(mean_metrics[4]),
+        "total": total,
+        "valid": total,
+        "failed": 0,
+        **parsed,
+        "error_file": "builtin_eval_matting",
     }
 
-    print()
-    print(
-        f"[eval] Valid results: "
-        f"{result['valid']}/{result['total']}"
-    )
-    print(
-        f"{'MSE':>12} "
-        f"{'MAD':>12} "
-        f"{'SAD':>12} "
-        f"{'Grad':>12} "
-        f"{'Conn':>12}"
-    )
-    print(
-        f"{result['MSE']:12.4f} "
-        f"{result['MAD']:12.4f} "
-        f"{result['SAD']:12.4f} "
-        f"{result['Grad']:12.4f} "
-        f"{result['Conn']:12.4f}"
-    )
-
-    error_file = benchmark_output / "evaluation_failures.txt"
-
-    with error_file.open("w", encoding="utf-8") as f:
-        for error in errors:
-            f.write(error + "\n")
-
-    result["error_file"] = str(error_file)
-
     return result
-
 
 # ============================================================
 # 汇总
@@ -1386,8 +1128,7 @@ def parse_args():
         "--prompt",
         type=str,
         default=(
-            "Transform to matting map while maintaining "
-            "original composition"
+            "Transform to matting map while maintaining original composition"
         ),
     )
 
@@ -1591,7 +1332,6 @@ def main():
 
     if evaluation_results:
         print_summary(evaluation_results)
-
     save_summary(
         output_root=output_root,
         args=args,
